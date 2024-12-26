@@ -101,19 +101,6 @@ class TmaAutoTuneHelper:
     configs=[
         triton.Config(
             {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "NUM_CONSUMER_GROUPS": 2,
-            },
-            num_stages=2,
-            num_warps=4,
-            num_consumer_groups=2,
-            num_buffers_warp_spec=3,
-        ),
-        triton.Config(
-            {
                 "BLOCK_SIZE_M": 64,
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": 128,
@@ -122,7 +109,7 @@ class TmaAutoTuneHelper:
             },
             num_stages=3,
             num_warps=4,
-            num_consumer_groups=0, # disable warp specialization
+            num_consumer_groups=1,
             num_buffers_warp_spec=3,
         ),
     ],
@@ -332,4 +319,4 @@ def benchmark(M, N, K, provider):
 
 
 test()
-benchmark.run(show_plots=True, print_data=True)
+# benchmark.run(show_plots=True, print_data=True)
