@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
@@ -112,6 +113,7 @@ public:
   LogicalResult matchAndRewrite(DescriptorLoadOp op,
                                 PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     auto createLoad = [&](Value tmaPtr, Value barrierAlloc, Value alloc,
                           Value pred) {
       auto indices = translateTMAIndices(
@@ -120,7 +122,7 @@ public:
       rewriter.create<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(
           op.getLoc(), tmaPtr, indices, barrierAlloc, alloc, pred);
     };
-    lowerTMALoad(op, op.getType(), op.getDesc(), createLoad, rewriter);
+    lowerTMALoad(op, op.getType(), op.getDesc(), createLoad, baseRewriter);
     return success();
   }
 };
@@ -199,19 +201,21 @@ public:
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(MakeTensorDescOp op,
-                                PatternRewriter &rewriter) const override {
+                                PatternRewriter &baseRewriter) const override {
     MLIRContext *ctx = op.getContext();
     auto loc = op.getLoc();
+    PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     auto alloc = rewriter.create<triton::gpu::GlobalScratchAllocOp>(
-        loc, getPointerType(rewriter.getI8Type()), TMA_SIZE_BYTES, TMA_ALIGN);
-    if (failed(createTMADesc(alloc, op, rewriter))) {
+        loc, getPointerType(baseRewriter.getI8Type()), TMA_SIZE_BYTES,
+        TMA_ALIGN);
+    if (failed(createTMADesc(alloc, op, baseRewriter))) {
       return failure();
     }
     rewriter.create<triton::ExperimentalTensormapFenceproxyAcquireOp>(
         loc, alloc.getResult());
     auto newDesc = rewriter.create<triton::ReinterpretTensorDescOp>(
         loc, op.getType(), alloc.getResult());
-    rewriter.replaceOp(op, newDesc);
+    baseRewriter.replaceOp(op, newDesc);
     return success();
   }
 };
