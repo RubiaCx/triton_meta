@@ -20,6 +20,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 
 #include <cassert>
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -552,11 +553,12 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
   }
 };
 
-void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
+void createBarrier(ConversionPatternRewriter &rewriter, Operation *op,
                    int numCTAs) {
+  auto loc = op->getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   if (numCTAs == 1) {
-    b.barrier();
+    insertBarrier(rewriter, op);
   } else {
     rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
     rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
@@ -684,7 +686,7 @@ struct AtomicCASOpConversion
         st(dstOprStore, valOprStore).maybePredicate(threadPred);
         auto ASMReturnTy = void_ty(ctx);
         ptxBuilderStore.launch(rewriter, loc, ASMReturnTy);
-        createBarrier(rewriter, loc, numCTAs);
+        createBarrier(rewriter, op, numCTAs);
         Value ret = b.load(valueElemTy, atomPtr);
         rewriter.replaceOp(op, {ret});
       }
@@ -881,7 +883,7 @@ struct AtomicRMWOpConversion
         atomPtr = b.bitcast(atomPtr, ptr_ty(ctx, 3));
         // Only threads with rmwMask = True store the result
         targetInfo.storeShared(rewriter, loc, atomPtr, loadAcquireOp, pred);
-        createBarrier(rewriter, loc, numCTAs);
+        createBarrier(rewriter, op, numCTAs);
         Value ret = b.load(valueElemTy, atomPtr);
         rewriter.replaceOp(op, {ret});
         continue;
@@ -1011,7 +1013,7 @@ struct AtomicRMWOpConversion
         atomPtr = b.bitcast(atomPtr, ptr_ty(ctx, 3));
         // Only threads with rmwMask = True store the result
         targetInfo.storeShared(rewriter, loc, atomPtr, old, pred);
-        createBarrier(rewriter, loc, numCTAs);
+        createBarrier(rewriter, op, numCTAs);
         Value ret = b.load(valueElemTy, atomPtr);
         rewriter.replaceOp(op, {ret});
       }
@@ -1249,6 +1251,13 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto ctaOffset = getCtaOffset(rewriter, loc, encoding, shapePerCTA);
     int elementsPerCTA = product(shapePerCTA) * packingFactor;
 
+    auto asyncTaskIds = getAsyncTaskIds(op);
+    int firstThreadId = 0;
+    if (!asyncTaskIds.empty()) {
+      assert(asyncTaskIds.size() == 1 && "only support single async task");
+      firstThreadId = asyncTaskIds[0] * numWarps * warpSize;
+    }
+
     // The bounding box inner dimension must be less than or equal to the
     // swizzle size.
     // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
@@ -1258,8 +1267,9 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
       if (numWarpsToCopy == 1)
         warpID = b.i32_val(0);
-      Value boxPred =
-          b.and_(pred, b.icmp_ult(id, b.i32_val(numWarpsToCopy * warpSize)));
+      Value boxPred = b.and_(
+          pred,
+          b.icmp_ult(id, b.i32_val(numWarpsToCopy * warpSize + firstThreadId)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
       Type elemPtrTy = ptr_ty(rewriter.getContext(), 3);
       Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
@@ -1301,6 +1311,14 @@ struct AsyncTMACopyGlobalToLocalOpConversion
   }
 };
 
+int getWarpOffset(Operation *op) {
+  auto asyncTaskIds = getAsyncTaskIds(op);
+  if (asyncTaskIds.size() > 0) {
+    return 4 * *std::min_element(asyncTaskIds.begin(), asyncTaskIds.end());
+  }
+  return 0;
+}
+
 struct AsyncTMACopyLocalToGlobalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp> {
@@ -1341,6 +1359,9 @@ struct AsyncTMACopyLocalToGlobalOpConversion
       int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
       if (numWarpsToCopy == 1)
         warpID = b.i32_val(0);
+      auto warpOffset = getWarpOffset(op);
+      warpID = b.sub(warpID, b.i32_val(warpOffset));
+      id = b.sub(id, b.i32_val(warpOffset * warpSize));
       Value boxPred =
           b.and_(pred, b.icmp_ult(id, b.i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;

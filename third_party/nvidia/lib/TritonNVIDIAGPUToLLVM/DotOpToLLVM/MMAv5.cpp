@@ -367,13 +367,21 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
                     Value b, Value loadedA, Value loadedB,
                     MemDescType dTensorTy, Value useDFlag, Value pred,
                     ValueRange barriers, ValueRange barrierPreds, bool twoCTAs,
-                    const DotConversion &op) {
+                    const DotConversion &op, Operation *dot) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to
   // detect that tid.x == 0 is true only for 1 thread.
   Value warpId = rewriter.create<nvgpu::WarpIdOp>(loc);
-  Value isWarp0 = tb.icmp_eq(warpId, tb.i32_val(0));
+  auto asyncTaskIds = getAsyncTaskIds(dot);
+  int executingWarpId = 0;
+  if (!asyncTaskIds.empty()) {
+    assert(asyncTaskIds.size() == 1 && "only support single async task");
+    int numWarps = triton::gpu::lookupNumWarps(dot);
+    executingWarpId = asyncTaskIds[0] * numWarps;
+  }
+
+  Value isWarp0 = tb.icmp_eq(warpId, tb.i32_val(executingWarpId));
   if (twoCTAs) {
     // TODO: we have to sync the two CTAs because we currently don't use remove
     // barriers for the copies.
@@ -519,7 +527,7 @@ void convertDot(const LLVMTypeConverter &typeConverter,
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), twoCTAs, dot);
+                 adaptor.getBarrierPreds(), twoCTAs, dot, op);
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {
@@ -632,7 +640,7 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), /*twoCTAs=*/false, dot);
+                 adaptor.getBarrierPreds(), /*twoCTAs=*/false, dot, op);
 }
 
 //===----------------------------------------------------------------------===//
