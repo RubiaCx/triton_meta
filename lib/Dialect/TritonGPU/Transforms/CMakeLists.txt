@@ -28,6 +28,11 @@ add_triton_library(TritonGPUTransforms
   ReorderInstructions.cpp
   CoalesceAsyncCopy.cpp
   Utility.cpp
+  TaskIdPropagate.cpp
+  WSTaskPartition.cpp
+  WSDataPartition.cpp
+  WSCodePartition.cpp
+  WSLowering.cpp
 
   DEPENDS
   TritonGPUTransformsIncGen
