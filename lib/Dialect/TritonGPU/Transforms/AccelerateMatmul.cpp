@@ -541,8 +541,9 @@ public:
         rewriter.create<ConvertLayoutOp>(loc, newAccType, dotOp.getOperand(2));
     auto acc = rewriter.create<triton::nvidia_gpu::TMEMAllocOp>(
         loc, accMemDescType, cvtAcc);
+    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, dotOp);
     auto vTrue = rewriter.create<arith::ConstantIntOp>(dotOp.getLoc(), 1, 1);
-    auto mma = rewriter.create<triton::nvidia_gpu::TCGen5MMAOp>(
+    auto mma = taskIdRewriter.create<triton::nvidia_gpu::TCGen5MMAOp>(
         loc, a, b, acc, vTrue, vTrue, Value(), UnitAttr());
     mma.setTwoCtas(useTwoCTAs);
 
@@ -730,7 +731,8 @@ public:
     Value scaleB = rewriter.create<triton::nvidia_gpu::TMEMAllocOp>(
         loc, scaleBType, newScaleB);
     auto vTrue = rewriter.create<arith::ConstantIntOp>(dotOp.getLoc(), 1, 1);
-    rewriter.create<triton::nvidia_gpu::TCGen5MMAScaledOp>(
+    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, dotOp);
+    taskIdRewriter.create<triton::nvidia_gpu::TCGen5MMAScaledOp>(
         loc, a, b, acc, scaleA, scaleB, dotOp.getAElemType(),
         dotOp.getBElemType(), vTrue, vTrue, Value());
 
