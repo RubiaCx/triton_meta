@@ -269,6 +269,11 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)
+            passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,
+                                                 opt.reg_dec_producer, opt.reg_inc_consumer)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 9:
             passes.ttgpuir.add_fuse_nested_loops(pm)
