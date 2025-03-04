@@ -33,6 +33,7 @@ include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
@@ -541,9 +542,9 @@ def TTNG_GetAsyncTaskIdOp : TTNG_Op<"get_async_task_id", [Pure]> {
 def TTNG_CreateTokenOp : TTNG_Op<"create_token"> {
   let results = (outs TensorOf<[TTNG_TokenType]>:$result);
 
-  let arguments = (ins I32Attr:$num);
+  let arguments = (ins I32Attr:$num, TT_TokenLoadTypeAttr:$loadType);
 
-  let builders = [OpBuilder<(ins "uint32_t":$num)>];
+  let builders = [OpBuilder<(ins "uint32_t":$num, "triton::nvidia_gpu::TokenLoadType":$loadType)>];
 
   let assemblyFormat = "attr-dict `:` type($result)";
 }

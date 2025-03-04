@@ -32,7 +32,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func public @matmul_kernel(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %0 = ttg.local_alloc  : () -> !ttg.memdesc<1x128x256xf16, #shared, #ttg.shared_memory, mutable>
     %1 = ttg.local_alloc  : () -> !ttg.memdesc<1x256x128xf16, #shared, #ttg.shared_memory, mutable>
-    %2 = ttng.create_token {num = 1 : i32} : tensor<1x!ttng.token>
+    %2 = ttng.create_token {loadType = 1 : i32, num = 1 : i32} : tensor<1x!ttng.token>
     %3 = ttng.get_async_task_id : i32
     %c0_i32 = arith.constant 0 : i32
     %4 = arith.cmpi eq, %3, %c0_i32 : i32
