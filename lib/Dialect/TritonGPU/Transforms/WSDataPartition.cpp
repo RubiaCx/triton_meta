@@ -60,12 +60,15 @@ void fixTaskId(triton::FuncOp &funcOp) {
       // Do not update loads.
       if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(defOp))
         continue;
+      // Skip control flow ops.
+      if (isa<scf::YieldOp>(op))
+        continue;
       auto defTaskIds = getAsyncTaskIds(defOp);
       // Make sure defTaskIds cover asyncTaskIds. Call addAsyncTaskIds if
       // necessary.
       if (!oneVecCoversTheOther(defTaskIds, asyncTaskIds)) {
         // Const ops with same value but different task ids can be folded.
-        if (isa<arith::ConstantIntOp>(defOp)) {
+        if (defOp->getDialect()->getNamespace() == "arith") {
           LLVM_DEBUG({
             LDBG("backward fixing taskId for");
             defOp->dump();
@@ -80,7 +83,7 @@ void fixTaskId(triton::FuncOp &funcOp) {
       if (operand.hasOneUse() &&
           !oneVecCoversTheOther(asyncTaskIds, defTaskIds)) {
         // YieldOp may lose task attribute during MLIR canonicalization.
-        if (isa<scf::YieldOp>(op)) {
+        if (isa<scf::YieldOp, scf::IfOp>(op)) {
           LLVM_DEBUG({
             LDBG("forward fixing taskId for");
             defOp->dump();
@@ -140,6 +143,23 @@ void getBackwardSliceToPartition(Value root, unsigned dim, int sliceSize,
           queue.push_back(dotOp.getD());
         } else if (auto tensorDescOp = dyn_cast<ReinterpretTensorDescOp>(op)) {
           continue;
+        } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+          // track yield value
+          // find result index of v
+          unsigned resultIndex = 0;
+          for (int i = 0; i < op->getNumResults(); ++i) {
+            if (op->getResult(i) == v) {
+              resultIndex = i;
+              break;
+            }
+          }
+
+          auto thenYieldArg = ifOp.thenYield().getOperand(resultIndex);
+          backwardSlice.insert(ifOp.thenYield());
+          queue.push_back(thenYieldArg);
+          auto elseYieldArg = ifOp.elseYield().getOperand(resultIndex);
+          backwardSlice.insert(ifOp.elseYield());
+          queue.push_back(elseYieldArg);
         } else {
           llvm_unreachable("Unexpected op");
         }
