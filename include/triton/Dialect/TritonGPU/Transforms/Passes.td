@@ -381,4 +381,19 @@ def TritonGPUWSCanonicalization : Pass<"tritongpu-warp-spec-canonicalization", "
            "number of consumer warp groups for warp specialization">
   ];
 }
+
+def TritonGPUPingPongSync: Pass<"tritongpu-ping-pong-sync", "mlir::ModuleOp"> {
+  let summary = "TritonGPU experiemental ping pong schedule";
+
+  let description = "This pass inserts barriers to enforce critical section for gemms.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+  let options = [
+    Option<"numConsumerGroups", "num-consumer-groups",
+           "int32_t", /*default*/"1",
+           "number of consumer warp groups for warp specialization">,
+  ];
+}
+
 #endif
