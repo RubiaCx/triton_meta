@@ -325,13 +325,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.if %[[#WG1]]
 // CHECK: ttng.reg_alloc 232
 // CHECK: scf.for
-// CHECK: ttng.producer_acquire
 // CHECK: scf.for
 // CHECK: ttng.wait_barrier
 // CHECK: ttg.local_load
 // CHECK: ttg.local_load
 // CHECK: ttng.warp_group_dot
 // CHECK: ttng.consumer_release
+// CHECK: ttng.producer_acquire
 // CHECK: ttg.local_store
 // CHECK: ttng.producer_commit
 // CHECK: %c2_i32 = arith.constant 2 : i32
@@ -340,8 +340,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttng.reg_alloc 232
 // CHECK: scf.for
 // CHECK: scf.for
-// CHECK: ttg.local_load
 // CHECK: ttng.consumer_wait
+// CHECK: ttg.local_load
 // CHECK: ttng.consumer_release
 // CHECK: tt.experimental_descriptor_store
 

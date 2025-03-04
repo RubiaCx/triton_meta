@@ -1724,10 +1724,10 @@ DenseMap<Channel *, Value> createBuffer(
   return bufferMap;
 }
 
-static Operation *createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap,
-                                  Channel *c, Operation *op,
-                                  SmallVector<AsyncTaskId> &asyncTasksPC,
-                                  Value bufferIdx, Value bufferIdxExtract) {
+static std::pair<Operation *, Operation *>
+createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
+                Operation *op, SmallVector<AsyncTaskId> &asyncTasksPC,
+                Value bufferIdx, Value bufferIdxExtract) {
   auto loadOp = cast<triton::LoadOp>(op);
   auto buffer = bufferMap.find(c)->second;
   MLIRContext *context = loadOp->getContext();
@@ -1739,7 +1739,7 @@ static Operation *createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap,
   Value loadResult = loadOp.getResult();
   auto tensorType = dyn_cast<RankedTensorType>(loadResult.getType());
   if (!tensorType)
-    return nullptr;
+    return {nullptr, nullptr};
   // Get basic information from tensorType
   auto order = ttg::getOrder(tensorType);
   auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
@@ -1784,14 +1784,14 @@ static Operation *createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap,
   // Replace all uses of loadResult
   loadResult.replaceAllUsesWith(sharedLoad.getResult());
   loadOp.erase();
-  return copy;
+  return {copy, sharedLoad};
 }
 
 // Create a local copy for a channel that is populated by the producer and
 // accessed by the consumer.
-static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
-                            Channel *channel, Value srcBufferIdx,
-                            Value dstBufferIdx) {
+static std::pair<Operation *, Operation *>
+createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
+                Value srcBufferIdx, Value dstBufferIdx) {
   Operation *srcOp = channel->getSrcOp();
   Operation *dstOp = channel->getDstOp();
   MLIRContext *context = srcOp->getContext();
@@ -1800,7 +1800,7 @@ static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
   Value srcValue = channel->getSrcOperand();
   auto tensorType = dyn_cast<RankedTensorType>(srcValue.getType());
   if (!tensorType)
-    return;
+    return {nullptr, nullptr};
   // Get basic information from tensorType
   auto order = ttg::getOrder(tensorType);
   auto CTALayout = ttg::getCTALayout(tensorType.getEncoding());
@@ -1846,6 +1846,7 @@ static void createLocalCopy(const DenseMap<Channel *, Value> &bufferMap,
   // Create local_alloc
   Operation *copy = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
       srcOp->getLoc(), srcValue, srcView);
+  return {copy, sharedLoad};
 }
 
 static int getTMALoadSize(tt::ExperimentalDescriptorLoadOp &tmaLoad) {
@@ -1978,7 +1979,9 @@ void insertAsyncComm(
         &channelsGroupedByConsumers,
     const DenseMap<Channel *, DenseMap<int, Value>> &tokenMap,
     const DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap,
-    const DenseMap<Channel *, Value> &bufferMap, int numConsumerGroups) {
+    const DenseMap<Channel *, Value> &bufferMap,
+    const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
+    int numConsumerGroups) {
 
   // Find the operation that is along producer's parent chain, and its parent
   // is the same op as producer's parent. Here p is producer, and c is consumer.
@@ -1992,7 +1995,7 @@ void insertAsyncComm(
     llvm_unreachable("Failed to find consumer's same level Op with producer");
   };
 
-  auto consumerReleaseHeutistic = [&](Operation *p, Operation *c,
+  auto consumerReleaseHeuristic = [&](Operation *p, Operation *c,
                                       int consumerAsyncTaskId) -> Operation * {
     if (c->getBlock() != p->getBlock())
       return getSameLevelOp(p, c);
@@ -2066,7 +2069,9 @@ void insertAsyncComm(
     DenseSet<Operation *> producerOps;
     DenseSet<Operation *> consumerOps;
     for (auto &c : kv.second) {
-      producerOps.insert(c->getSrcOp());
+      auto pcOp = copyOpMap.find(c)->second;
+      producerOps.insert(pcOp.first);
+      consumerOps.insert(pcOp.second);
       consumerOps.insert(c->getDstOp());
     }
 
@@ -2168,7 +2173,7 @@ void insertAsyncComm(
 
       // Insert ConsumerReleaseOp.
       auto consumerReleasePoint =
-          consumerReleaseHeutistic(tailProducer, tailConsumer, token.first);
+          consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
       builder.setInsertionPointAfter(consumerReleasePoint);
       builder.createWithAsyncTaskIds<ttng::ConsumerReleaseOp>(
           consumerReleasePoint->getLoc(), token.second, bufferIdx);
@@ -2200,10 +2205,12 @@ void insertAsyncComm(
 
 // Lower producers for channels. Here channels are grouped in
 // "channelsGroupedByProducers"
-void insertAsyncCopy(triton::FuncOp funcOp,
-                     const DenseMap<Channel *, SmallVector<Channel *>>
-                         &channelsGroupedByProducers,
-                     const DenseMap<Channel *, Value> &bufferMap) {
+void insertAsyncCopy(
+    triton::FuncOp funcOp,
+    const DenseMap<Channel *, SmallVector<Channel *>>
+        &channelsGroupedByProducers,
+    const DenseMap<Channel *, Value> &bufferMap,
+    DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap) {
   // For each producer op, create a async_copy or local_store from the producer
   // to the buffer. Create a local_load from the buffer at the dominating
   // consumer.
@@ -2249,22 +2256,33 @@ void insertAsyncCopy(triton::FuncOp funcOp,
           srcOp->getLoc(), 0, 32);
     }
 
-    for (auto channel : mutuallyNonDominatingChannels) {
-      // No need to create async copy for TMA load which is handled in
-      // insertAsyncComm.
-      if (isa<tt::ExperimentalDescriptorLoadOp, ttg::LocalLoadOp>(srcOp)) {
-        continue;
-      }
-      if (isa<triton::LoadOp>(srcOp)) {
-        SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);
-        asyncTasksPC.append(getAsyncTaskIds(channel->getDstOp()));
-        // After createAsyncCopy, c->getSrcOp()/headProducer are no longer
-        // valid.
-        createAsyncCopy(bufferMap, channel, channel->getSrcOp(), asyncTasksPC,
-                        bufferIdx, bufferIdx);
-      } else {
-        createLocalCopy(bufferMap, channel, bufferIdx, bufferIdx);
-      }
+    assert(mutuallyNonDominatingChannels.size() == 1 &&
+           "conditional consumers not supported");
+
+    auto domininatingChannel = *mutuallyNonDominatingChannels.begin();
+    std::pair<Operation *, Operation *> producerConsumerOps{nullptr, nullptr};
+
+    // No need to create async copy for TMA load which will be handled in
+    // insertAsyncComm.
+    if (isa<tt::ExperimentalDescriptorLoadOp>(srcOp)) {
+      producerConsumerOps = {srcOp, domininatingChannel->getDstOp()};
+    } else if (isa<triton::LoadOp>(srcOp)) {
+      SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);
+      asyncTasksPC.append(getAsyncTaskIds(domininatingChannel->getDstOp()));
+      // After createAsyncCopy, c->getSrcOp()/headProducer are no longer
+      // valid.
+      producerConsumerOps = createAsyncCopy(bufferMap, domininatingChannel,
+                                            domininatingChannel->getSrcOp(),
+                                            asyncTasksPC, bufferIdx, bufferIdx);
+    } else {
+      assert(!isa<ttg::LocalLoadOp>(srcOp) &&
+             "LocalLoadOp buffer should be reused");
+      producerConsumerOps =
+          createLocalCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
+    }
+
+    for (auto &channel : kv.second) {
+      copyOpMap[channel] = producerConsumerOps;
     }
   }
 }
@@ -2358,19 +2376,21 @@ public:
       funcOp.dump();
     });
 
-    // Step 6: add async communication ops (ProducerAcquire etc). Also lower the
-    // loads.
-    insertAsyncComm(funcOp, channelsGroupedByConsumers, tokenMap,
-                    barrierAllocMap, bufferMap, numConsumerGroups);
+    // Step 6: Lower the loads. Also add local copy ops for non-load
+    // producers.
+    DenseMap<Channel *, std::pair<Operation *, Operation *>> copyOpMap;
+    insertAsyncCopy(funcOp, channelsGroupedByProducers, bufferMap, copyOpMap);
     LLVM_DEBUG({
-      LDBG("\n\nwith SyncOps");
+      LDBG("\n\nwith async copy");
       funcOp.dump();
     });
 
-    // Step 7: Lower the loads. Also add local copy ops for non-load producers.
-    insertAsyncCopy(funcOp, channelsGroupedByProducers, bufferMap);
+    // Step 7: add async communication ops (ProducerAcquire etc). Also lower
+    // TMA loads.
+    insertAsyncComm(funcOp, channelsGroupedByConsumers, tokenMap,
+                    barrierAllocMap, bufferMap, copyOpMap, numConsumerGroups);
     LLVM_DEBUG({
-      LDBG("\n\nwith async copy");
+      LDBG("\n\nwith SyncOps");
       funcOp.dump();
     });
 
