@@ -1934,6 +1934,7 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // Convert all the producers to async_tma_copy_global_to_local
   Operation *copy = nullptr;
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
+    builder.setInsertionPoint(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
     Value tmaPtr =
