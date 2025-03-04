@@ -296,6 +296,7 @@ class CUDABackend(BaseBackend):
             if capability // 10 == 10:
                 nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
                 nvidia.passes.ttnvgpuir.add_keep_acc_in_tmem(pm) # do we have this pass?
+            passes.ttgpuir.add_ping_pong_sync(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)
             passes.common.add_canonicalizer(pm)
         else:
