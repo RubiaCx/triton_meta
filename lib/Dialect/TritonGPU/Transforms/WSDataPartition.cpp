@@ -436,8 +436,8 @@ Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   // slice operands first
   Operation *newOp;
   if (op->hasTrait<OpTrait::Elementwise>() ||
-      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, LocalAllocOp>(
-          op)) {
+      isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, LocalAllocOp,
+          FpToFpOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
