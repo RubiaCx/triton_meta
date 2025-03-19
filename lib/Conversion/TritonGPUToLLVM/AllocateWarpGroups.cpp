@@ -17,9 +17,6 @@ struct AllocateWarpGroups
           AllocateWarpGroups> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    if (auto totalNumWarps =
-            mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
-      return;
 
     // Compute the total number of warps required at any given time.
     int baseNumWarps = lookupNumWarps(mod);
@@ -47,6 +44,12 @@ struct AllocateWarpGroups
       op.setWarpGroupStartIds(startIds);
     });
 
+    if (auto totalNumWarps =
+            mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps")) {
+      if (maxExtraWarps == 0)
+        // There is no WarpSpecializeOp and ttg.total-num-warps is already set.
+        return;
+    }
     Builder b(&getContext());
     mod->setAttr("ttg.total-num-warps",
                  b.getI32IntegerAttr(baseNumWarps + maxExtraWarps));

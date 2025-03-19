@@ -263,8 +263,6 @@ public:
     // "num-warp-groups-per-cta" can be used to calculate the total number of
     // warps.
     auto builder = OpBuilder::atBlockBegin(mod.getBody());
-    mod->setAttr("ttg.num-warp-groups-per-cta",
-                 builder.getI32IntegerAttr(1 + numConsumerGroups));
     int numWarps = triton::gpu::lookupNumWarps(mod);
     mod->setAttr("ttg.total-num-warps",
                  builder.getI32IntegerAttr(numWarps * (1 + numConsumerGroups)));
