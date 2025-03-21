@@ -451,26 +451,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.if
 // CHECK: scf.yield
 
-// CHECK: %[[IF_IDX:.*]] = scf.if
-// CHECK: arith.divui %c0{{.*}}
-// CHECK: arith.subi %c0{{.*}}
-// CHECK: scf.for
+// We have reuses across the two IfOps, each having ForOp inside.
+// CHECK: %[[IF_IDX:.*]]:[[NUM:.*]] = scf.if
+// CHECK: scf.for {{.*}}(%arg{{.*}} = %c0
 // CHECK: scf.yield
 // CHECK: arith.addi
 // CHECK: %[[NEW_IDX:.*]] = arith.addi %c0
+// For the IfOp, either yield the loop count or zero
 // CHECK: scf.yield {{.*}} %[[NEW_IDX]]
 // CHECK: scf.yield {{.*}} %c0_
 
 // CHECK: scf.if
-// CHECK: arith.divui %[[IF_IDX]]
-// CHECK: arith.subi %[[IF_IDX]]
-// CHECK: scf.for
+// CHECK: scf.for {{.*}}(%arg{{.*}} = %[[IF_IDX]]#1
 // CHECK: scf.yield
 // CHECK: arith.addi
-// CHECK: %[[NEW_IDX2:.*]] = arith.addi %[[IF_IDX]]
+// CHECK: %[[NEW_IDX2:.*]] = arith.addi %[[IF_IDX]]#1
+// For the IfOp, either yield output of first IfOp + loop count or output of first IfOp
 // CHECK: scf.yield {{.*}} %[[NEW_IDX2]]
 // CHECK: scf.yield {{.*}} %[[IF_IDX]]
 
+// Here it is the first consumer.
 // CHECK: %[[ONE:.*]] = arith.constant 1 : i32
 // CHECK: %[[TWG1:.*]] = arith.cmpi eq, %[[TID]], %[[ONE]] : i32
 // CHECK: scf.if %[[TWG1]]
@@ -478,9 +478,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.if
 // CHECK: scf.yield
 
-// CHECK: %[[IF_IDX_WG1:.*]] = scf.if
-// CHECK: arith.divui %c0{{.*}}
-// CHECK: arith.subi %c0{{.*}}
+// CHECK: %[[IF_IDX_WG1:.*]]:[[NUM1:.*]] = scf.if
 // CHECK: scf.for
 // CHECK: scf.yield
 // CHECK: arith.addi
@@ -489,15 +487,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.yield {{.*}} %c0_
 
 // CHECK: scf.if
-// CHECK: arith.divui %[[IF_IDX_WG1]]
-// CHECK: arith.subi %[[IF_IDX_WG1]]
 // CHECK: scf.for
 // CHECK: scf.yield
 // CHECK: arith.addi
-// CHECK: %[[NEW_IDX2_WG1:.*]] = arith.addi %[[IF_IDX_WG1]]
+// CHECK: %[[NEW_IDX2_WG1:.*]] = arith.addi %[[IF_IDX_WG1]]#1
 // CHECK: scf.yield {{.*}} %[[NEW_IDX2_WG1]]
 // CHECK: scf.yield {{.*}} %[[IF_IDX_WG1]]
 
+// Here it is the second consumer.
 // CHECK: %[[TWO:.*]] = arith.constant 2 : i32
 // CHECK: %[[TWG2:.*]] = arith.cmpi eq, %[[TID]], %[[TWO]] : i32
 // CHECK: scf.if %[[TWG2]]
@@ -505,9 +502,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.if
 // CHECK: scf.yield
 
-// CHECK: %[[IF_IDX_WG2:.*]] = scf.if
-// CHECK: arith.divui %c0{{.*}}
-// CHECK: arith.subi %c0{{.*}}
+// CHECK: %[[IF_IDX_WG2:.*]]:[[NUM2:.*]] = scf.if
 // CHECK: scf.for
 // CHECK: scf.yield
 // CHECK: arith.addi
@@ -516,12 +511,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: scf.yield {{.*}} %c0_
 
 // CHECK: scf.if
-// CHECK: arith.divui %[[IF_IDX_WG2]]
-// CHECK: arith.subi %[[IF_IDX_WG2]]
 // CHECK: scf.for
 // CHECK: scf.yield
 // CHECK: arith.addi
-// CHECK: %[[NEW_IDX2_WG2:.*]] = arith.addi %[[IF_IDX_WG2]]
+// CHECK: %[[NEW_IDX2_WG2:.*]] = arith.addi %[[IF_IDX_WG2]]#1
 // CHECK: scf.yield {{.*}} %[[NEW_IDX2_WG2]]
 // CHECK: scf.yield {{.*}} %[[IF_IDX_WG2]]
 
