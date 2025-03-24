@@ -2910,7 +2910,7 @@ class async_task:
     Context manager to run code fragments asynchronously.
     """
     def __init__(self, task_ids, _builder=None):
-        self.task_ids = task_ids
+        self.task_ids = list({_constexpr_to_value(tid) for tid in task_ids})
         self.builder = _builder
 
     def __enter__(self):
