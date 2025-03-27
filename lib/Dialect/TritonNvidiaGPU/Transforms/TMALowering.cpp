@@ -112,7 +112,7 @@ public:
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(DescriptorLoadOp op,
-                                PatternRewriter &rewriter) const override {
+                                PatternRewriter &baseRewriter) const override {
     auto loc = op.getLoc();
     PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     auto createLoad = [&](Value tmaPtr, Value barrierAlloc, Value alloc,
@@ -133,7 +133,7 @@ struct TMAGatherLowering : public OpRewritePattern<DescriptorGatherOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(DescriptorGatherOp op,
-                                PatternRewriter &rewriter) const override {
+                                PatternRewriter &baseRewriter) const override {
     PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     auto createLoad = [&](Value tmaPtr, Value barrierAlloc, Value alloc,
                           Value pred) {
@@ -174,7 +174,7 @@ struct TMAStoreLowering : public OpRewritePattern<DescriptorStoreOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(DescriptorStoreOp op,
-                                PatternRewriter &rewriter) const override {
+                                PatternRewriter &baseRewriter) const override {
     PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     auto createStore = [&](Value tmaPtr, Value alloc) {
       auto indices = translateTMAIndices(
@@ -193,7 +193,7 @@ struct TMAScatterLowering : public OpRewritePattern<DescriptorScatterOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(DescriptorScatterOp op,
-                                PatternRewriter &rewriter) const override {
+                                PatternRewriter &baseRewriter) const override {
     PatternRewriterWithAsyncTaskIds rewriter(baseRewriter, op);
     auto createStore = [&](Value tmaPtr, Value alloc) {
       rewriter.create<triton::nvidia_gpu::AsyncTMAScatterOp>(

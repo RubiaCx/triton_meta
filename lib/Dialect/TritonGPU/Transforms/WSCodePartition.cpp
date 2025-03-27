@@ -1062,7 +1062,7 @@ void getTransitiveUsers(Value root,
 void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
                           triton::FuncOp &funcOp, unsigned numBuffers) {
   funcOp.walk([&](Operation *op) {
-    if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op) ||
+    if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
         isa<mlir::triton::DotOpInterface>(op)) {
       auto producerTaskIds = getAsyncTaskIds(op);
       if (producerTaskIds.empty() || producerTaskIds.size() > 1) {
@@ -2087,7 +2087,7 @@ DenseMap<Channel *, DenseMap<int, Value>> createToken(
       auto copyOp = copyOpMap.find(channel)->second.first;
       if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
         tokenLoadType = ttng::TokenLoadType::AsyncLoadOp;
-      } else if (isa<ExperimentalDescriptorLoadOp>(copyOp)) {
+      } else if (isa<DescriptorLoadOp>(copyOp)) {
         tokenLoadType = ttng::TokenLoadType::TMALoadOp;
       } else if (isa<LocalStoreOp>(copyOp)) {
         tokenLoadType = ttng::TokenLoadType::LocalStoreOp;
@@ -2112,7 +2112,7 @@ DenseMap<Channel *, DenseMap<int, Value>> createToken(
       }
 
       auto producerOp = it->second.front()->getSrcOp();
-      if (isa<tt::ExperimentalDescriptorLoadOp>(producerOp)) {
+      if (isa<tt::DescriptorLoadOp>(producerOp)) {
         Value bAlloc = createBarrierAlloc(funcOp, channel->numBuffers);
         // Channels in the group share the same set of tokens.
         for (auto &c : it->second) {
@@ -2339,7 +2339,7 @@ createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   return {copy, sharedLoad};
 }
 
-static int getTMALoadSize(tt::ExperimentalDescriptorLoadOp &tmaLoad) {
+static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
   auto tensorTy = cast<RankedTensorType>(tmaLoad->getResult(0).getType());
   int loadSize = product(tensorTy.getShape());
   return loadSize * tensorTy.getElementType().getIntOrFloatBitWidth() / 8;
@@ -2395,12 +2395,12 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
       buffer.getLoc(), subviewTy, buffer, copyOffsets);
 }
 
-Operation *
-optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                 SmallVector<tt::ExperimentalDescriptorLoadOp> &tmaLoads,
-                 SmallVector<Value> &buffers, Value barrierAlloc,
-                 Value bufferIdx, Value bufferIdxExtract, Value phase,
-                 Operation *headProducer, Operation *headConsumer) {
+Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                            SmallVector<tt::DescriptorLoadOp> &tmaLoads,
+                            SmallVector<Value> &buffers, Value barrierAlloc,
+                            Value bufferIdx, Value bufferIdxExtract,
+                            Value phase, Operation *headProducer,
+                            Operation *headConsumer) {
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
@@ -2648,7 +2648,7 @@ void insertAsyncComm(
 
       // Insert ProducerCommitOp if producer is LoadOp. For TMA, TMA lowering
       // will handle the ProducerCommit.
-      if (!isa<tt::ExperimentalDescriptorLoadOp>(headProducer)) {
+      if (!isa<tt::DescriptorLoadOp>(headProducer)) {
         builder.setInsertionPointAfter(tailProducer);
         builder.createWithAsyncTaskIds<ttng::ProducerCommitOp>(
             tailProducer->getLoc(), token.second, bufferIdx);
@@ -2658,7 +2658,7 @@ void insertAsyncComm(
     for (auto token : tokens) {
       builder.setAsynTaskIdsFromArray(token.first);
       // Insert ConsumerWaitOp
-      if (!isa<tt::ExperimentalDescriptorLoadOp>(headProducer)) {
+      if (!isa<tt::DescriptorLoadOp>(headProducer)) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
         builder.createWithAsyncTaskIds<ttng::ConsumerWaitOp>(
@@ -2673,13 +2673,12 @@ void insertAsyncComm(
           consumerReleasePoint->getLoc(), token.second, bufferIdx);
     }
 
-    SmallVector<tt::ExperimentalDescriptorLoadOp> tmaLoads;
+    SmallVector<tt::DescriptorLoadOp> tmaLoads;
     SmallVector<Value> buffers;
     DenseMap<Operation *, Operation *> producerCopyMap;
     // Go through all channels in this channel group.
     for (auto &c : kv.second) {
-      if (auto tmaLoad =
-              dyn_cast<tt::ExperimentalDescriptorLoadOp>(c->getSrcOp())) {
+      if (auto tmaLoad = dyn_cast<tt::DescriptorLoadOp>(c->getSrcOp())) {
         tmaLoads.push_back(tmaLoad);
         buffers.push_back(bufferMap.find(c)->second);
       }
@@ -2763,7 +2762,7 @@ void insertAsyncCopy(
 
     // No need to create async copy for TMA load which will be handled in
     // insertAsyncComm.
-    if (isa<tt::ExperimentalDescriptorLoadOp>(srcOp)) {
+    if (isa<tt::DescriptorLoadOp>(srcOp)) {
       producerConsumerOps = {srcOp, domininatingChannel->getDstOp()};
     } else if (isa<triton::LoadOp>(srcOp)) {
       SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);

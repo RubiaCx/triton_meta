@@ -193,7 +193,7 @@ bool verifyTaskId(triton::FuncOp &funcOp,
     }
 
     auto partitionShouldBeUsedSpecified = [](Operation *op) {
-      if (isa<StoreOp, ExperimentalDescriptorLoadOp>(op))
+      if (isa<StoreOp, DescriptorLoadOp>(op))
         return true;
       if (isa<AtomicRMWOp, AtomicCASOp>(op))
         return true;
@@ -218,7 +218,7 @@ bool verifyTaskId(triton::FuncOp &funcOp,
       Operation *defOp = operand.getDefiningOp();
       if (!defOp)
         continue;
-      if (llvm::isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(defOp))
+      if (llvm::isa<tt::LoadOp, tt::DescriptorLoadOp>(defOp))
         continue;
       auto defTaskIds = getAsyncTaskIds(defOp);
       // Make sure defTaskIds cover asyncTaskIds. Call addAsyncTaskIds if

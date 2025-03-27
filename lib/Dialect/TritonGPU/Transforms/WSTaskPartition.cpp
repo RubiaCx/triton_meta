@@ -62,7 +62,7 @@ void doPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       loops.push_back(forOp);
     else if (isa<nvidia_gpu::WarpGroupDotOp>(op))
       dots.push_back(op);
-    else if (isa<triton::LoadOp, ExperimentalDescriptorLoadOp>(op))
+    else if (isa<triton::LoadOp, DescriptorLoadOp>(op))
       loads.push_back(op);
   });
 
@@ -100,10 +100,10 @@ void doPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     getBackwardSlice(dotOp.getA(), &backwardSlice, opt);
     getBackwardSlice(dotOp.getB(), &backwardSlice, opt);
     for (auto depOp : backwardSlice) {
-      if (isa<ExperimentalDescriptorLoadOp>(depOp)) {
-          producerOps.insert(depOp);
+      if (isa<DescriptorLoadOp>(depOp)) {
+        producerOps.insert(depOp);
       } else if (isa<triton::LoadOp>(depOp) && isExpensiveLoadOrStore(depOp)) {
-          producerOps.insert(depOp);
+        producerOps.insert(depOp);
       }
     }
   }
