@@ -355,6 +355,8 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
   return ctrlId;
 }
 
+// Get the current accumulation count for the given op within its immediate
+// scope.
 // ForA (accumForA, accumIfA, accumForB, accumIfB)
 //   IfA (accumIfA, accumForB)
 //     Channel A --> uses ForA.arg[accumIfA]
@@ -371,13 +373,11 @@ unsigned getAccumArgIdx(scf::ForOp parentForOp, Operation *ctrlOp,
 // Right now, we only support a limited form of buffer reuse. We only allow
 // reuses among a list of parallel control ops. And we will add a single
 // AccumCnt as the last argument.
-void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
-                          unsigned numBuffers,
-                          const DenseSet<Operation *> &opsWithChannels,
-                          Value &outBufferIdx, Value &phase,
-                          SmallVector<Operation *> &opsWithBufferReuse) {
-  auto parentForOp = dstOp->getParentOfType<scf::ForOp>();
-  auto *pOp = dstOp->getParentOp();
+Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                    const DenseSet<Operation *> &opsWithChannels,
+                    SmallVector<Operation *> &opsWithBufferReuse) {
+  auto parentForOp = op->getParentOfType<scf::ForOp>();
+  auto *pOp = op->getParentOp();
   // Get parentForOp.arg[pOp]
   unsigned accumArgId;
   unsigned tSize = parentForOp.getBody()->getArguments().size();
@@ -386,10 +386,10 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
   Value accumCnt;
   bool partOfReuse = false;
   if (opsWithBufferReuse.size() > 1) {
-    partOfReuse = channelWithReuse(dstOp, opsWithBufferReuse);
+    partOfReuse = channelWithReuse(op, opsWithBufferReuse);
   }
   if (opsWithBufferReuse.size() > 1 && partOfReuse) {
-    // Check to see if the dstOp is inside opsWithBufferReuse.
+    // Check to see if the op is inside opsWithBufferReuse.
     accumCnt = parentForOp.getBody()->getArguments().back();
     accumArgId = parentTCnts - 1;
   } else {
@@ -398,11 +398,17 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
     accumCnt =
         parentForOp.getBody()->getArgument(tSize - parentTCnts + accumArgId);
   }
-  LDBG("getBufferIdxAndPhase: parentForOp "
-       << parentForOp.getOperation() << " pOp " << pOp << " " << tSize << " "
-       << parentTCnts << " " << accumArgId);
 
-  auto loc = dstOp->getLoc();
+  LDBG("getAccumCount: parentForOp " << parentForOp.getOperation() << " pOp "
+                                     << pOp << " " << tSize << " "
+                                     << parentTCnts << " " << accumArgId);
+  return accumCnt;
+}
+
+// Compute and return the buffer index and phase for a given accumulate count.
+std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+                                             Location loc, Value accumCnt,
+                                             unsigned numBuffers) {
   Value numBuffersVal =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, numBuffers, 32);
   numBuffersVal = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
@@ -416,14 +422,56 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *dstOp,
       loc, accumCnt,
       builder.createWithAsyncTaskIds<arith::MulIOp>(loc, bufferIdx,
                                                     numBuffersVal));
-  outBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+  initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
       loc, builder.getI32Type(), initBufferIdx);
 
   Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
   bufferIdx =
       builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
-  phase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+  Value initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
       loc, builder.getI1Type(), bufferIdx);
+  return {initBufferIdx, initPhase};
+}
+
+void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                          unsigned numBuffers,
+                          const DenseSet<Operation *> &opsWithChannels,
+                          Value &bufferIdx, Value &phase,
+                          SmallVector<Operation *> &opsWithBufferReuse) {
+  Value accumCnt =
+      getAccumCount(builder, op, opsWithChannels, opsWithBufferReuse);
+  std::tie(bufferIdx, phase) =
+      getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
+}
+
+// Get the bufferIdx and phase for the last iteration of the immediate scope.
+std::pair<Value, Value>
+getOutOfScopeBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+                               Operation *op, unsigned numBuffers,
+                               const DenseSet<Operation *> &opsWithChannels,
+                               SmallVector<Operation *> &opsWithBufferReuse) {
+  // Get the current in-scope accumulation count for op.
+  Value accumCnt =
+      getAccumCount(builder, op, opsWithChannels, opsWithBufferReuse);
+
+  // Get the out-of-scope accumulation count.
+  assert(isa<BlockArgument>(accumCnt) &&
+         "Expected accumCnt to be a block argument");
+  auto bbArg = dyn_cast<BlockArgument>(accumCnt);
+  Operation *bbAargOwner = bbArg.getOwner()->getParentOp();
+  if (auto forOp = dyn_cast<scf::ForOp>(bbAargOwner)) {
+    accumCnt = forOp.getResult(bbArg.getArgNumber() - 1);
+  } else {
+    llvm_unreachable("Unexpected block argument owner");
+  }
+
+  // The accumulation count is one past the last iteration. Subtract one to get
+  // the last valid iteration index.
+  auto loc = bbAargOwner->getLoc();
+  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+  accumCnt = builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, one);
+
+  return getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
 }
 
 static bool
@@ -1192,6 +1240,47 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   });
 }
 
+// When the consumer is a local_alloc loading from shared memory to registers,
+// look ahead for the actual consumers, usually dot ops, that can directly
+// use shared memory. The local_alloc will be removed later.
+static SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
+  if (isa<LocalAllocOp>(consumerOp)) {
+    DenseSet<Operation *> users;
+    for (auto user : consumerOp->getUsers()) {
+      if (isa<TransOp, MemDescTransOp>(user)) {
+        // TransOp is not a real consumer. It caculates the shared memory
+        // address for the real consumer. Continue to find its transitive users
+        // recursively.
+        DenseSet<Operation *> visited;
+        SmallVector<Operation *> transUsers;
+        transUsers.push_back(user);
+        while (!transUsers.empty()) {
+          auto transUser = transUsers.pop_back_val();
+          visited.insert(transUser);
+          if (isa<TransOp, MemDescTransOp>(transUser)) {
+            for (auto transitiveUser : transUser->getUsers()) {
+              if (!visited.count(transitiveUser))
+                transUsers.push_back(transitiveUser);
+            }
+          } else {
+            users.insert(transUser);
+          }
+        }
+      } else {
+        users.insert(user);
+      }
+    }
+
+    return SmallVector<Operation *>(users.begin(), users.end());
+  }
+  return {consumerOp};
+}
+
+static Operation *getUniqueActualConsumer(Operation *consumerOp) {
+  auto consumers = getActualConsumers(consumerOp);
+  return consumers.size() == 1 ? consumers[0] : consumerOp;
+}
+
 // Group channels in two ways:
 //  - by producer ops. One producer corresponds to multiple channels. This
 //    grouping will be used to create buffers per shared producer.
@@ -1236,14 +1325,13 @@ void groupChannels(
     Operation *dst1 = c1->getDstOp(), *dst2 = c2->getDstOp();
     if (dst1 == dst2)
       return true;
-    if (dst1->getBlock() != dst2->getBlock() || !dst1->hasOneUse() ||
-        !dst2->hasOneUse())
-      return false;
     // Check taskIds on dstOps.
     if (getAsyncTaskIds(dst1) != getAsyncTaskIds(dst2))
       return false;
-    Operation *dst1User = *(dst1->getUsers().begin());
-    Operation *dst2User = *(dst2->getUsers().begin());
+    auto dst1User = getUniqueActualConsumer(dst1);
+    auto dst2User = getUniqueActualConsumer(dst2);
+    if (!dst1User || !dst2User)
+      return false;
     return dst1User == dst2User && dst1User->getBlock() == dst1->getBlock();
   };
   assert(channels.size() > 0 && "channel size is zero");
@@ -2134,20 +2222,29 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   return barrierAlloc;
 }
 
+struct CommChannel {
+  DenseMap<int, Value> tokens;
+  // Producer barrier is only needed when the producer op itself can update the
+  // barrier inline, such as the TMA load.
+  std::optional<Value> producerBarrier;
+  // Consumer barrier is only needed when the consumer op itself can update the
+  // barrier inline, such as the TCGen5MMAOp.
+  std::optional<Value> consumerBarrier;
+};
+
 // channelsGroupedByConsumers: channels are grouped together.
 // Go through each group, check the first channel in the group, create a token
 // for each consumer taskId. Return a map that maps each channel + consumer
 // taskId to a token. Also update barrierAllocMap that maps each channel +
 // consumer taskId to a BarrierAlloc.
-DenseMap<Channel *, DenseMap<int, Value>> createToken(
+void createToken(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
     const SmallVector<Channel *> &orderedChannels, triton::FuncOp funcOp,
     int numConsumerGroups,
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
     DenseMap<Channel *, SmallVector<Channel *>> &channelReuse,
-    DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap) {
-  DenseMap<Channel *, DenseMap<int, Value>> ret;
+    DenseMap<Channel *, CommChannel> &tokenMap) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   for (auto *key : orderedChannels) {
@@ -2155,51 +2252,75 @@ DenseMap<Channel *, DenseMap<int, Value>> createToken(
     Channel *channel = it->second.front();
     if (!channelReuse.count(channel))
       continue;
+
+    CommChannel commChannel;
+    auto producerOp = it->second.front()->getSrcOp();
+    auto consumerOp = it->second.front()->getDstOp();
+    consumerOp = getUniqueActualConsumer(consumerOp);
+
+    if (isa<tt::ExperimentalDescriptorLoadOp>(producerOp)) {
+      commChannel.producerBarrier =
+          createBarrierAlloc(funcOp, channel->numBuffers);
+    }
+
     for (auto consumerAsyncTaskId : channel->relation.second) {
-      ttng::TokenLoadType tokenLoadType;
-      auto copyOp = copyOpMap.find(channel)->second.first;
-      if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
-        tokenLoadType = ttng::TokenLoadType::AsyncLoadOp;
-      } else if (isa<ExperimentalDescriptorLoadOp>(copyOp)) {
-        tokenLoadType = ttng::TokenLoadType::TMALoadOp;
-      } else if (isa<LocalStoreOp>(copyOp)) {
-        tokenLoadType = ttng::TokenLoadType::LocalStoreOp;
-      } else {
-        llvm_unreachable("Unexpected load type");
+      // No token is needed for a TMA <-> TCGen5MMAOp channel
+      if (!isa<tt::ExperimentalDescriptorLoadOp>(producerOp) ||
+          !isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
+        ttng::TokenLoadType tokenLoadType;
+        auto copyOp = copyOpMap.find(channel)->second.first;
+        if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
+          tokenLoadType = ttng::TokenLoadType::AsyncLoadOp;
+        } else if (isa<ExperimentalDescriptorLoadOp>(copyOp)) {
+          tokenLoadType = ttng::TokenLoadType::TMALoadOp;
+        } else if (isa<LocalStoreOp>(copyOp)) {
+          tokenLoadType = ttng::TokenLoadType::LocalStoreOp;
+        } else {
+          llvm_unreachable("Unexpected load type");
+        }
+        Value v;
+        if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>())
+          v = builder.create<ttng::CreateTokenOp>(
+              funcOp.getLoc(), channel->numBuffers, tokenLoadType);
+        else
+          v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(), 1,
+                                                  tokenLoadType);
+        commChannel.tokens[consumerAsyncTaskId] = v;
       }
 
-      Value v;
-      if (it->second.front()->getSrcOp()->getParentOfType<scf::ForOp>()) {
-        v = builder.create<ttng::CreateTokenOp>(
-            funcOp.getLoc(), channel->numBuffers, tokenLoadType);
-      } else {
-        v = builder.create<ttng::CreateTokenOp>(funcOp.getLoc(), 1,
-                                                tokenLoadType);
-      }
-      // Channels in the group share the same set of tokens.
-      for (auto &c : it->second) {
-        ret[c][consumerAsyncTaskId] = v;
-      }
-      for (auto *reuse : channelReuse[channel]) {
-        ret[reuse][consumerAsyncTaskId] = v;
-      }
-
-      auto producerOp = it->second.front()->getSrcOp();
-      if (isa<tt::ExperimentalDescriptorLoadOp>(producerOp)) {
-        Value bAlloc = createBarrierAlloc(funcOp, channel->numBuffers);
-        // Channels in the group share the same set of tokens.
-        for (auto &c : it->second) {
-          ret[c][consumerAsyncTaskId] = v;
-          barrierAllocMap[c][consumerAsyncTaskId] = bAlloc;
-        }
-        for (auto *reuse : channelReuse[channel]) {
-          ret[reuse][consumerAsyncTaskId] = v;
-          barrierAllocMap[reuse][consumerAsyncTaskId] = bAlloc;
-        }
+      if (isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
+        Value v = createBarrierAlloc(funcOp, channel->numBuffers);
+        commChannel.consumerBarrier = v;
       }
     }
+
+    // Channels in the group share the same set of tokens.
+    for (auto &c : it->second) {
+      tokenMap[c] = commChannel;
+    }
+    for (auto *reuse : channelReuse[channel]) {
+      tokenMap[reuse] = commChannel;
+    }
   }
-  return ret;
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "Communication Channels: \n";
+    for (auto &item : tokenMap) {
+      llvm::dbgs() << "\ndata channel: \n";
+      llvm::dbgs() << *item.first->getSrcOp() << "\n";
+      llvm::dbgs() << *item.first->getDstOp() << "\n";
+      llvm::dbgs() << "communication channel: \n";
+      for (auto &kv : item.second.tokens) {
+        llvm::dbgs() << "token: " << kv.first << " " << kv.second << "\n";
+      }
+      if (item.second.producerBarrier)
+        llvm::dbgs() << "producer barrier: " << *item.second.producerBarrier
+                     << "\n";
+      if (item.second.consumerBarrier)
+        llvm::dbgs() << "consumer barrier: " << *item.second.consumerBarrier
+                     << "\n";
+    }
+  });
 }
 
 // Create a buffer array for each producer op, if the producer is in a ForOp,
@@ -2536,6 +2657,63 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   return copy;
 }
 
+// Make TCGen5MMAOp fully asynchronous by de-synchronizing it. This leverages
+// its inline barrier to synchronize with both the producer (TMA load) and the
+// consumer (TMEM load).
+void desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder,
+                       nvidia_gpu::TCGen5MMAOp mmaOp, Value barrierAlloc,
+                       Value bufferIdx, Value phase, unsigned numBuffers,
+                       Operation *headProducer,
+                       DenseSet<Operation *> &opsWithChannels,
+                       SmallVector<Operation *> &opsWithBufferReuse) {
+  // Attach the barrier as an operand of the mma op.
+  builder.setInsertionPoint(mmaOp);
+  builder.setAsyncTaskIdsFromOp(mmaOp);
+  auto consumerBarrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  mmaOp.getBarrierMutable().assign(consumerBarrier);
+
+  // Create a wait_barrier before the producer.
+  builder.setInsertionPoint(headProducer);
+  builder.setAsyncTaskIdsFromOp(headProducer);
+  auto producerBarrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  // curPhase = curPhase xor True for emptyBarrier.
+  auto loc = headProducer->getLoc();
+  Value _1_1b = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+  phase =
+      builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, phase, _1_1b);
+  phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+      loc, builder.getI32Type(), phase);
+  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, producerBarrier,
+                                                      phase);
+
+  // Create a wait_barrier before the tmem load.
+  SetVector<std::pair<Operation *, unsigned>> users;
+  getTransitiveUsers(mmaOp.getD(), users);
+  for (auto item : users) {
+    auto user = item.first;
+    if (user == mmaOp)
+      continue;
+    builder.setInsertionPoint(user);
+    builder.setAsyncTaskIdsFromOp(user);
+    // If user and mmaOp are in the same block, we can use the same barrier.
+    if (user->getBlock() != mmaOp->getBlock()) {
+      // Compute the barrier from the last consumer instance
+      // Extract the accum count from the consumer block.
+      std::tie(bufferIdx, phase) = getOutOfScopeBufferIdxAndPhase(
+          builder, mmaOp, numBuffers, opsWithChannels, opsWithBufferReuse);
+      phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          user->getLoc(), builder.getI32Type(), phase);
+      consumerBarrier =
+          getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+    }
+
+    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(user->getLoc(),
+                                                        consumerBarrier, phase);
+  }
+}
+
 // Lower producers for channels. Here channels are grouped in
 // "channelsGroupedByConsumers". tokenMap tracks the set of tokens for each
 // channel.
@@ -2543,7 +2721,7 @@ void insertAsyncComm(
     triton::FuncOp funcOp,
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
-    const DenseMap<Channel *, DenseMap<int, Value>> &tokenMap,
+    const DenseMap<Channel *, CommChannel> &tokenMap,
     const DenseMap<Channel *, DenseMap<int, Value>> &barrierAllocMap,
     const DenseMap<Channel *, Value> &bufferMap,
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
@@ -2562,6 +2740,7 @@ void insertAsyncComm(
     llvm_unreachable("Failed to find consumer's same level Op with producer");
   };
 
+  mlir::PostDominanceInfo dom(funcOp);
   auto consumerReleaseHeuristic = [&](Operation *p, Operation *c,
                                       int consumerAsyncTaskId) -> Operation * {
     if (c->getBlock() != p->getBlock())
@@ -2569,35 +2748,9 @@ void insertAsyncComm(
 
     // Find a common place for all users of the consumer, which would be the
     // common post dominator.
-    mlir::PostDominanceInfo dom(funcOp);
+    auto actualConsumers = getActualConsumers(c);
     std::unordered_set<Operation *> mutuallyNonDominatingUsers;
-    SmallVector<Operation *> users;
-    for (auto user : c->getUsers()) {
-      if (isa<TransOp, MemDescTransOp>(user)) {
-        // TransOp is not a real consumer. It caculates the shared memory
-        // address for the real consumer. Continue to find its transitive users
-        // recursively.
-        DenseSet<Operation *> visited;
-        SmallVector<Operation *> transUsers;
-        transUsers.push_back(user);
-        while (!transUsers.empty()) {
-          auto transUser = transUsers.pop_back_val();
-          visited.insert(transUser);
-          if (isa<TransOp, MemDescTransOp>(transUser)) {
-            for (auto transitiveUser : transUser->getUsers()) {
-              if (!visited.count(transitiveUser))
-                transUsers.push_back(transitiveUser);
-            }
-          } else {
-            users.push_back(transUser);
-          }
-        }
-      } else {
-        users.push_back(user);
-      }
-    }
-
-    for (auto user : users) {
+    for (auto user : actualConsumers) {
       auto it = mutuallyNonDominatingUsers.begin();
       while (it != mutuallyNonDominatingUsers.end()) {
         if (dom.properlyPostDominates(user, *it)) {
@@ -2640,6 +2793,7 @@ void insertAsyncComm(
       producerOps.insert(pcOp.first);
       consumerOps.insert(pcOp.second);
       consumerOps.insert(c->getDstOp());
+      consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
     }
 
     // Find head producer
@@ -2678,7 +2832,7 @@ void insertAsyncComm(
     }
 
     // We have one set of tokens for each channel group.
-    auto tokens = tokenMap.find(kv.second.front())->second;
+    auto &commChannel = tokenMap.find(kv.second.front())->second;
     auto masterChannel = kv.getFirst();
 
     SmallVector<AsyncTaskId> asyncTaskP;
@@ -2716,37 +2870,42 @@ void insertAsyncComm(
     }
 
     builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
-    for (auto token : tokens) {
-      // Insert ProducerAcquireOp before the producer.
-      builder.setInsertionPoint(headProducer);
-      builder.createWithAsyncTaskIds<ttng::ProducerAcquireOp>(
-          headProducer->getLoc(), token.second, bufferIdx, phase);
+    for (const auto &token : commChannel.tokens) {
+      if (!commChannel.consumerBarrier) {
+        // Insert ProducerAcquireOp before the producer.
+        builder.setInsertionPoint(headProducer);
+        builder.createWithAsyncTaskIds<ttng::ProducerAcquireOp>(
+            headProducer->getLoc(), token.second, bufferIdx, phase);
+      }
 
-      // Insert ProducerCommitOp if producer is LoadOp. For TMA, TMA lowering
+      // Insert ProducerCommitOp if producer is not TMA. For TMA, TMA lowering
       // will handle the ProducerCommit.
-      if (!isa<tt::ExperimentalDescriptorLoadOp>(headProducer)) {
+      if (!commChannel.producerBarrier) {
         builder.setInsertionPointAfter(tailProducer);
         builder.createWithAsyncTaskIds<ttng::ProducerCommitOp>(
             tailProducer->getLoc(), token.second, bufferIdx);
       }
     }
 
-    for (auto token : tokens) {
+    for (const auto &token : commChannel.tokens) {
       builder.setAsynTaskIdsFromArray(token.first);
       // Insert ConsumerWaitOp
-      if (!isa<tt::ExperimentalDescriptorLoadOp>(headProducer)) {
+      if (!commChannel.producerBarrier) {
         auto consumerWaitPoint = getSameLevelOp(headProducer, headConsumer);
         builder.setInsertionPoint(consumerWaitPoint);
         builder.createWithAsyncTaskIds<ttng::ConsumerWaitOp>(
             headConsumer->getLoc(), token.second, bufferIdx, phase);
       }
 
-      // Insert ConsumerReleaseOp.
-      auto consumerReleasePoint =
-          consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
-      builder.setInsertionPointAfter(consumerReleasePoint);
-      builder.createWithAsyncTaskIds<ttng::ConsumerReleaseOp>(
-          consumerReleasePoint->getLoc(), token.second, bufferIdx);
+      // Insert ConsumerReleaseOp, if consumer is not a TCGen5MMAOp. For
+      // TCGen5MMAOp, TCGen5MMAOp lowering will handle the ConsumerReleaseOp.
+      if (!isa<nvidia_gpu::TCGen5MMAOp>(tailConsumer)) {
+        auto consumerReleasePoint =
+            consumerReleaseHeuristic(tailProducer, tailConsumer, token.first);
+        builder.setInsertionPointAfter(consumerReleasePoint);
+        builder.createWithAsyncTaskIds<ttng::ConsumerReleaseOp>(
+            consumerReleasePoint->getLoc(), token.second, bufferIdx);
+      }
     }
 
     SmallVector<tt::ExperimentalDescriptorLoadOp> tmaLoads;
@@ -2761,14 +2920,19 @@ void insertAsyncComm(
       }
     }
 
+    // Desynchronize TCGen5MMAOp. Set up consumer release and producer acquire.
+    auto &c = kv.first;
+    if (auto mmaOp = dyn_cast<nvidia_gpu::TCGen5MMAOp>(
+            getUniqueActualConsumer(c->getDstOp()))) {
+      desyncTCGen5MMAOp(builder, mmaOp, *commChannel.consumerBarrier, bufferIdx,
+                        phase, c->numBuffers, headProducer, opsWithChannels,
+                        opsWithBufferReuse);
+    }
+
     // Optimize TMA loads.
     if (tmaLoads.size() > 0) {
-      auto barrierAllocs = barrierAllocMap.find(kv.second.front())->second;
-      // TODO: we created one Alloc for each consumer taskId, but here, we
-      // only use the first Alloc.
-      auto barrierAlloc = barrierAllocs.begin()->second;
-      optimizeTMALoads(builder, tmaLoads, buffers, barrierAlloc, bufferIdx,
-                       bufferIdx, phase, headProducer, headConsumer);
+      optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
+                       bufferIdx, bufferIdx, phase, headProducer, headConsumer);
     }
   }
 }
@@ -2969,9 +3133,9 @@ public:
     // Step 7: Create tokens. A set of tokens for each group of channels for
     // each channel.
     DenseMap<Channel *, DenseMap<int, Value>> barrierAllocMap;
-    DenseMap<Channel *, DenseMap<int, Value>> tokenMap = createToken(
-        channelsGroupedByConsumers, orderedChannels, funcOp, numConsumerGroups,
-        copyOpMap, channelReuse, barrierAllocMap);
+    DenseMap<Channel *, CommChannel> tokenMap;
+    createToken(channelsGroupedByConsumers, orderedChannels, funcOp,
+                numConsumerGroups, copyOpMap, channelReuse, tokenMap);
     LLVM_DEBUG({
       LDBG("\n\nafter createToken");
       funcOp.dump();
