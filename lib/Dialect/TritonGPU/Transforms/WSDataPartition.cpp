@@ -295,7 +295,7 @@ bool getBackwardSliceToPartition(Value v, DataPartitionScheme &partitionScheme,
             BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp, ConvertLayoutOp,
             triton::gpu::LocalAllocOp, LoadOp, TransOp, MemDescTransOp,
             AtomicRMWOp, triton::AddPtrOp, ExperimentalDescriptorLoadOp,
-            nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp>(op)) {
+            nvidia_gpu::TMEMAllocOp, nvidia_gpu::TMEMLoadOp, FpToFpOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
           return false;
