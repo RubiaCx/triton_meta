@@ -2350,6 +2350,9 @@ void createToken(
           tokenLoadType = ttng::TokenLoadType::LocalStoreOp;
         } else if (isa<ttng::TMEMLoadOp>(consumerOp)) {
           tokenLoadType = ttng::TokenLoadType::TmemLoadOp;
+        } else if (isa<nvidia_gpu::TCGen5MMAOp>(consumerOp)) {
+          // For operand A of gen5, we have tmem_store + gen5.
+          tokenLoadType = ttng::TokenLoadType::TmemLoadOp;
         } else {
           llvm_unreachable("Unexpected load type");
         }
@@ -2406,7 +2409,8 @@ static ttng::TMEMAllocOp createTMemAlloc(OpBuilder &builder,
   auto oldRetType = oldTMemAllocOp.getType();
   SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
                                 oldRetType.getShape().end()};
-  if (numBuffers > 1) {
+  // We can still use subView in createTMEMCopy even if numBuffers is 1.
+  if (numBuffers >= 1) {
     shape.insert(shape.begin(), numBuffers);
   }
   Type accMemDescType = triton::gpu::MemDescType::get(
@@ -2471,8 +2475,6 @@ DenseMap<Channel *, Value> createBuffer(
       auto sliceShape = tensorType.getShape();
       auto sharedLayout = ttg::NVMMASharedEncodingAttr::get(
           context, sliceShape, order, CTALayout, elemType, /*fp4Padded*/ false);
-      auto sliceType =
-          RankedTensorType::get(sliceShape, elemType, sharedLayout);
 
       // Get shape, layout and type of the complete buffer
       SmallVector<int64_t> bufferShape(sliceShape.begin(), sliceShape.end());
@@ -2482,8 +2484,6 @@ DenseMap<Channel *, Value> createBuffer(
         bufferShape.insert(bufferShape.begin(), 1);
       Attribute sharedMemorySpace =
           triton::gpu::SharedMemorySpaceAttr::get(context);
-      auto bufferType =
-          RankedTensorType::get(bufferShape, elemType, sharedLayout);
       Type memdescType =
           ttg::MemDescType::get(bufferShape, elemType, sharedLayout,
                                 sharedMemorySpace, /*mutableMemory*/ true);
@@ -2674,18 +2674,57 @@ createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
   OpBuilderWithAsyncTaskIds builder(oldTMemAllocOp);
   builder.setInsertionPointAfter(oldTMemAllocOp);
 
-  // Create mem desc subview for the right buffer.
-  builder.setAsyncTaskIdsFromOp(oldTMemAllocOp);
+  // A tmemChannel is usually centered around a gen5 dotOp. There are two
+  // cases, one is that the channel is for the accumulator, the other is
+  // the channel is for operand A of the gen5.
+  // Here we replace tmem_alloc with tmem_store when applicable and create a
+  // subView that is used by tmem_store and also all users of tmem_alloc.
+  // Calculate the taskIds for the subView, and tmem_store.
+  // tmemStore's taskId can be the mmaOp's taskId if alloc.getSrc is available
+  // for mmaOp's taskId, otherwise, it should happen in alloc.getsrc.
+  Operation *opForStoreTask = tmemChannel->getMmaOp();
+  if (oldTMemAllocOp.getSrc()) {
+    auto taskIds = getAsyncTaskIds(opForStoreTask);
+    assert(taskIds.size() == 1);
+    // Check to see if alloc.getSrc is available for mmaOp's taskId.
+    auto *srcOp = oldTMemAllocOp.getSrc().getDefiningOp();
+    if (!hasAsyncTaskId(srcOp, taskIds[0]))
+      opForStoreTask = oldTMemAllocOp.getSrc().getDefiningOp();
+  }
+  // TaskIds for subView should be the union of tmem_store and all users of
+  // tmem_alloc.
+  SmallVector<AsyncTaskId> asyncTasksSubView = getAsyncTaskIds(opForStoreTask);
+  for (auto *user : oldTMemAllocOp->getUsers()) {
+    for (auto task : getAsyncTaskIds(user))
+      if (!llvm::is_contained(asyncTasksSubView, task))
+        asyncTasksSubView.push_back(task);
+  }
+  builder.setAsynTaskIdsFromArray(asyncTasksSubView);
+
   auto srcView = createBufferView(builder, newTMemAllocOp, srcBufferIdx);
-  builder.setAsyncTaskIdsFromOp(tmemChannel->getMmaOp());
-  Value vTrue = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-      oldTMemAllocOp.getLoc(), 1, 1);
-  auto tmemStoreOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
-      oldTMemAllocOp.getLoc(), srcView, oldTMemAllocOp.getSrc(), vTrue);
+  LLVM_DEBUG({
+    LDBG("createTMEMCopy: srcView ");
+    srcView.dump();
+  });
+
+  if (oldTMemAllocOp.getSrc()) {
+    builder.setAsyncTaskIdsFromOp(opForStoreTask);
+    Value vTrue = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        oldTMemAllocOp.getLoc(), 1, 1);
+    auto tmemStoreOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
+        oldTMemAllocOp.getLoc(), srcView, oldTMemAllocOp.getSrc(), vTrue);
+    oldTMemAllocOp->replaceAllUsesWith(srcView.getDefiningOp());
+    oldTMemAllocOp.erase();
+    tmemChannel->tmemProducerOp = tmemStoreOp;
+    return {tmemStoreOp, channel->getDstOp()};
+  }
+  // Handle the case where there is no value for tmem_alloc.
   oldTMemAllocOp->replaceAllUsesWith(srcView.getDefiningOp());
   oldTMemAllocOp.erase();
-  tmemChannel->tmemProducerOp = tmemStoreOp;
-  return {tmemStoreOp, channel->getDstOp()};
+  // We need a new srcOp now that tmemAlloc is erased, the new SrcOp will be
+  // the mmaOp.
+  tmemChannel->tmemProducerOp = tmemChannel->getMmaOp();
+  return {tmemChannel->getMmaOp(), channel->getDstOp()};
 }
 
 static int getTMALoadSize(tt::ExperimentalDescriptorLoadOp &tmaLoad) {
@@ -2815,7 +2854,7 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 // (TMEM load).
 ttng::WaitBarrierOp desyncTCGen5MMAOp(
     OpBuilderWithAsyncTaskIds &builder, nvidia_gpu::TCGen5MMAOp mmaOp,
-    Value barrierAlloc, Value bufferIdx, Value phase, unsigned numBuffers,
+    Value barrierAlloc, Value bufferIdx, Value inPhase, unsigned numBuffers,
     Operation *headProducer, DenseSet<Operation *> &opsWithChannels,
     SmallVector<Operation *> &opsWithBufferReuse, mlir::DominanceInfo &dom) {
   // Attach the barrier as an operand of the mma op.
@@ -2833,13 +2872,18 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
   // curPhase = curPhase xor True for emptyBarrier.
   auto loc = headProducer->getLoc();
   Value _1_1b = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  phase =
-      builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, phase, _1_1b);
+  // Creating phase for headProducer.
+  Value phase =
+      builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase, _1_1b);
   phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
       loc, builder.getI32Type(), phase);
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, producerBarrier,
                                                       phase);
 
+  LLVM_DEBUG({
+    LDBG("desync: create wait_barrier for producer ");
+    producerBarrier.dump();
+  });
   // Create a wait_barrier before the tmem load.
   SetVector<std::pair<Operation *, unsigned>> users;
   getTransitiveUsers(mmaOp.getD(), users);
@@ -2868,6 +2912,17 @@ ttng::WaitBarrierOp desyncTCGen5MMAOp(
           user->getLoc(), builder.getI32Type(), phase);
       consumerBarrier =
           getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+    } else {
+      // mmaOp can be in a different task from headProducer. Even if user and
+      // mma are in the same block and they share the same barrier, but the
+      // phases should be offset by 1.
+      auto loc = user->getLoc();
+      Value _1_1b =
+          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+      phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
+                                                                  _1_1b);
+      phase = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          loc, builder.getI32Type(), phase);
     }
 
     // TODO: if there are multiple users of the mma op, we need to barrier
@@ -3202,17 +3257,38 @@ void insertAsyncCopy(
         mutuallyNonDominatingChannels.insert(c);
     }
 
+    assert(mutuallyNonDominatingChannels.size() == 1 &&
+           "conditional consumers not supported");
+    auto domininatingChannel = *mutuallyNonDominatingChannels.begin();
     auto srcOp = kv.getFirst()->getSrcOp();
+    LLVM_DEBUG({
+      LDBG("insertAsyncCopy handle channel ");
+      srcOp->dump();
+      domininatingChannel->getDstOp()->dump();
+    });
+
     Value bufferIdx;
     Value phase = Value();
     OpBuilderWithAsyncTaskIds builder(srcOp);
+    // Calculate TaskIds for bufferIdx and phase.
     SmallVector<AsyncTaskId> asyncTasksPC = getAsyncTaskIds(srcOp);
     for (auto channel : mutuallyNonDominatingChannels) {
+      // bufferIdx will be used in createTMEMCopy to construct subView
+      // to feed into both tmem_store and users of tmem_alloc. There are cases
+      // where a TMEM channel has srcOp in task 2, dstOp in task 2, while mmaOp
+      // is in task 1.
+      if (channel->channelKind == DataChannelKind::TMEM) {
+        TmemDataChannel *tmemChannel = static_cast<TmemDataChannel *>(channel);
+        for (auto task : getAsyncTaskIds(tmemChannel->getMmaOp()))
+          if (!llvm::is_contained(asyncTasksPC, task))
+            asyncTasksPC.push_back(task);
+      }
       for (auto task : getAsyncTaskIds(channel->getDstOp()))
         if (!llvm::is_contained(asyncTasksPC, task))
           asyncTasksPC.push_back(task);
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
+
     if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
       LLVM_DEBUG({
         LDBG("call getBufferIdxAndPhase ");
@@ -3228,10 +3304,10 @@ void insertAsyncCopy(
           srcOp->getLoc(), 0, 32);
     }
 
-    assert(mutuallyNonDominatingChannels.size() == 1 &&
-           "conditional consumers not supported");
-
-    auto domininatingChannel = *mutuallyNonDominatingChannels.begin();
+    LLVM_DEBUG({
+      LDBG("-- bufferIdx ");
+      bufferIdx.dump();
+    });
     std::pair<Operation *, Operation *> producerConsumerOps{nullptr, nullptr};
 
     // No need to create async copy for TMA load which will be handled in
