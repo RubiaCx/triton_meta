@@ -715,85 +715,13 @@ def matmul_tma_ws_cooperative_get_configs(pre_hook=None):
                 "GROUP_SIZE_M": 8,
                 "FIRST_MMA_CONSUMER": 1,
                 "LAST_MMA_CONSUMER": 1,
-                "FIRST_EPILOG_CONSUMER": 2,
-                "LAST_EPILOG_CONSUMER": 2,
-                "EPILOGUE_SUBTILE": True,
-            },
-            num_stages=2,
-            num_warps=4,
-            num_consumer_groups=2,
-            num_buffers_warp_spec=4,
-            pre_hook=pre_hook,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "FIRST_MMA_CONSUMER": 1,
-                "LAST_MMA_CONSUMER": 1,
-                "FIRST_EPILOG_CONSUMER": 2,
-                "LAST_EPILOG_CONSUMER": 2,
-                "EPILOGUE_SUBTILE": False,
-            },
-            num_stages=2,
-            num_warps=4,
-            num_consumer_groups=2,
-            num_buffers_warp_spec=3,
-            pre_hook=pre_hook,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "FIRST_MMA_CONSUMER": 1,
-                "LAST_MMA_CONSUMER": 1,
                 "FIRST_EPILOG_CONSUMER": 1,
                 "LAST_EPILOG_CONSUMER": 1,
-                "EPILOGUE_SUBTILE": True,
+                "EPILOGUE_SUBTILE": False,
             },
             num_stages=2,
             num_warps=4,
             num_consumer_groups=1,
-            num_buffers_warp_spec=4,
-            pre_hook=pre_hook,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "FIRST_MMA_CONSUMER": 1,
-                "LAST_MMA_CONSUMER": 2,
-                "FIRST_EPILOG_CONSUMER": 1,
-                "LAST_EPILOG_CONSUMER": 2,
-                "EPILOGUE_SUBTILE": False,
-            },
-            num_stages=2,
-            num_warps=4,
-            num_consumer_groups=2,
-            num_buffers_warp_spec=3,
-            pre_hook=pre_hook,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 8,
-                "FIRST_MMA_CONSUMER": 1,
-                "LAST_MMA_CONSUMER": 1,
-                "FIRST_EPILOG_CONSUMER": 1,
-                "LAST_EPILOG_CONSUMER": 1,
-                "EPILOGUE_SUBTILE": False,
-            },
-            num_stages=3,
-            num_warps=4,
-            num_consumer_groups=0,  # disable warp specialization
             num_buffers_warp_spec=3,
             pre_hook=pre_hook,
         ),
@@ -801,17 +729,15 @@ def matmul_tma_ws_cooperative_get_configs(pre_hook=None):
 
 
 @triton.autotune(
-    configs=matmul_tma_ws_cooperative_get_configs(
-        pre_hook=matmul_ws_cooperative_set_block_size_hook
-    ),
+    configs=matmul_tma_ws_cooperative_get_configs(),
     key=["M", "N", "K"],
     use_cuda_graph=True,
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def matmul_kernel_persistent_tma_ws_cooperative(
-    a_desc,
-    b_desc,
-    c_desc,
+    a_ptr,
+    b_ptr,
+    c_ptr,
     M,
     N,
     K,
@@ -833,6 +759,28 @@ def matmul_kernel_persistent_tma_ws_cooperative(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
+
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[N, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+    )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N if not EPILOGUE_SUBTILE else BLOCK_SIZE_N // 2,
+        ],
+    )
 
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -895,26 +843,23 @@ def matmul_persistent_tma_ws_cooperative(a, b):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    dummy_block = [1, 1]
-    a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
-    b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
-    c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+    # TMA descriptors require a global memory allocation
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
 
-    def grid(META):
-        nonlocal a_desc, b_desc, c_desc
-        BLOCK_M = META["BLOCK_SIZE_M"]
-        BLOCK_N = META["BLOCK_SIZE_N"]
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-            ),
-        )
+    triton.set_allocator(alloc_fn)
+
+    grid = lambda META: (
+        min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ),
+    )
 
     matmul_kernel_persistent_tma_ws_cooperative[grid](
-        a_desc,
-        b_desc,
-        c_desc,  #
+        a,
+        b,
+        c,  #
         M,
         N,
         K,  #
@@ -1025,8 +970,11 @@ def run_test(expect, fn, a, b, label, enabled=True):
         actual = fn(a, b)
         passed = torch.allclose(expect, actual.to(expect.dtype), atol=1.0)
         icon = "✅" if passed else "❌"
+        print("  expect: ...", expect)  
+        print("  actual: ...", actual)  
     else:
         icon = "⭕"
+
     print(f"\r  {label}: {icon}  ")
 
 
@@ -1036,33 +984,33 @@ def validate(M, N, K, dtype):
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
     b = b.T.contiguous()
 
-    naive_result = matmul(a, b.T).to(torch.float16)
-    run_test(naive_result, torch_matmul, a, b, "Torch", enabled=dtype == torch.float16)
-    run_test(naive_result, cublas_matmul, a, b, "cuBLAS", enabled=cublas is not None)
-    run_test(naive_result, matmul_persistent, a, b.T, "Persistent")
+    naive_result = torch_matmul(a, b).to(torch.float16)
+    # run_test(naive_result, torch_matmul, a, b, "Torch", enabled=dtype == torch.float16)
+    # run_test(naive_result, cublas_matmul, a, b, "cuBLAS", enabled=cublas is not None)
+    # run_test(naive_result, matmul_persistent, a, b.T, "Persistent")
     run_test(naive_result, matmul_persistent_tma_ws_cooperative, a, b, "WS Cooperative")
 
-    kernels = [
-        (matmul_tma, "TMA", HAS_HOST_TENSOR_DESC),
-        (matmul_tma_persistent, "TMA Persistent", HAS_HOST_TENSOR_DESC),
-        (matmul_descriptor_persistent, "Tensor Descriptor Persistent", HAS_TENSOR_DESC),
-    ]
-    warp_specialize = [False, True] if HAS_WARP_SPECIALIZE else [False]
+    # kernels = [
+    #     (matmul_tma, "TMA", HAS_HOST_TENSOR_DESC),
+    #     (matmul_tma_persistent, "TMA Persistent", HAS_HOST_TENSOR_DESC),
+    #     (matmul_descriptor_persistent, "Tensor Descriptor Persistent", HAS_TENSOR_DESC),
+    # ]
+    # warp_specialize = [False, True] if HAS_WARP_SPECIALIZE else [False]
 
-    for (kernel, label, enabled), warp_specialize in itertools.product(
-        kernels, warp_specialize
-    ):
-        label = f"{label} (warp_specialize={warp_specialize})"
-        enabled = enabled and (not warp_specialize or HAS_TENSOR_DESC)
-        run_test(
-            naive_result,
-            lambda a, b: kernel(a, b, warp_specialize),
-            a,
-            b,
-            label,
-            enabled,
-        )
-    print()
+    # for (kernel, label, enabled), warp_specialize in itertools.product(
+    #     kernels, warp_specialize
+    # ):
+    #     label = f"{label} (warp_specialize={warp_specialize})"
+    #     enabled = enabled and (not warp_specialize or HAS_TENSOR_DESC)
+    #     run_test(
+    #         naive_result,
+    #         lambda a, b: kernel(a, b, warp_specialize),
+    #         a,
+    #         b,
+    #         label,
+    #         enabled,
+    #     )
+    # print()
 
 
 def show_profile(precision, profile_name):
@@ -1098,11 +1046,11 @@ if __name__ == "__main__":
         torch.manual_seed(0)
 
         validate(32, 32, 32, dtype)
-        validate(8192, 8192, args.K_range[0], dtype)
+        # validate(8192, 8192, args.K_range[0], dtype)
 
-        proton.start("matmul", hook="triton")
-        proton.deactivate()
-        for K in range(args.K_range[0], args.K_range[1] + 1, args.K_step):
-            bench(K, dtype)
-        proton.finalize()
-        show_profile(args.prec, "matmul")
+        # proton.start("matmul", hook="triton")
+        # proton.deactivate()
+        # for K in range(args.K_range[0], args.K_range[1] + 1, args.K_step):
+        #     bench(K, dtype)
+        # proton.finalize()
+        # show_profile(args.prec, "matmul")

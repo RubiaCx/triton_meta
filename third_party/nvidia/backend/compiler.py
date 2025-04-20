@@ -315,9 +315,10 @@ class CUDABackend(BaseBackend):
                 opt.reg_dec_producer,
                 opt.reg_inc_consumer,
             )
-            passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_ping_pong_sync(pm, opt.num_consumer_groups)
             passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)
+            if opt.num_consumer_groups == 0:
+                passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)

@@ -23,7 +23,7 @@ Value getLocalThreadId(ConversionPatternRewriter &rewriter, Operation *op) {
   auto mod = op->getParentOfType<ModuleOp>();
   Location loc = op->getLoc();
   Value threadId = getThreadId(rewriter, loc);
-  if (Attribute attr = mod->getAttr("triton_gpu.num-warp-groups-per-cta")) {
+  if (Attribute attr = mod->getAttr("ttg.total-num-warps")) {
     int numWarps = triton::gpu::lookupNumWarps(op);
     int warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
     auto b = TritonLLVMOpBuilder(loc, rewriter);
