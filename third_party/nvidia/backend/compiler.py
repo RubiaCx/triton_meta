@@ -417,7 +417,10 @@ class CUDABackend(BaseBackend):
             fmad = [] if opt.enable_fp_fusion else ['--fmad=false']
             arch = sm_arch_from_capability(capability)
             opt_level = ['--opt-level', '0'] if knobs.nvidia.disable_ptxas_opt else []
-            ptxas_cmd = [ptxas, *line_info, *fmad, '-v', *opt_level, f'--gpu-name={arch}', fsrc.name, '-o', fbin]
+            ptxas_cmd = [
+                ptxas, *line_info, *fmad, '-v', '--g-tensor-memory-access-check', *opt_level, f'--gpu-name={arch}',
+                fsrc.name, '-o', fbin
+            ]
             try:
                 subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
                 if os.path.exists(fsrc.name):
