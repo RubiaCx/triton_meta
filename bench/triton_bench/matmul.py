@@ -1,8 +1,14 @@
 import torch
 import triton
 import triton.language as tl
+import triton.profiler as proton
+from triton.tools.tensor_descriptor import TensorDescriptor
 import time
 import numpy as np
+import argparse
+import itertools
+from contextlib import contextmanager
+from typing import Optional
 
 if torch.cuda.is_available():
     from triton._C.libtriton import nvidia
@@ -316,6 +322,49 @@ def main():
             except Exception as e:
                 print(f"({M:>5},{N:>5},{K:>5}) | {kernel_type:>15} | Failed: {str(e)}")
         print("-" * 70)
+
+
+
+def cublas_matmul(a, b):
+    # Check constraints.
+    assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
+    M, K = a.shape
+    N, K = b.shape
+    dtype = a.dtype
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    bytes_per_elem = a.element_size()
+    flops_str = f"flops{bytes_per_elem * 8}"
+    with proton.scope(f"cublas [M={M}, N={N}, K={K}]", {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
+        cublas.matmul(a, b, c)
+    return c
+
+def torch_matmul(a, b):
+    M, K = a.shape
+    N, K = b.shape
+    bytes_per_elem = a.element_size()
+    flops_str = f"flops{bytes_per_elem * 8}"
+    with proton.scope(f"torch [M={M}, N={N}, K={K}]",
+                      {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
+        c = torch.matmul(a, b.T)
+    return c
+
+@contextmanager
+def proton_context():
+    proton.activate(0)
+    try:
+        yield
+    finally:
+        proton.deactivate(0)
+
+
+def bench_fn(label, reps, warmup_reps, fn, *args):
+    print(f"Benchmarking {label}: ...", end="")
+    for _ in range(warmup_reps):
+        fn(*args)
+    with proton_context():
+        for _ in range(reps):
+            fn(*args)
+    print(f"\rBenchmarking {label}: done")
 
 if __name__ == "__main__":
     main()

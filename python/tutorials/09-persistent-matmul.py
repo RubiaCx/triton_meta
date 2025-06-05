@@ -42,10 +42,8 @@ else:
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
-
 def supports_tma():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
 
 def supports_ws():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
